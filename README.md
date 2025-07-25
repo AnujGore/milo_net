@@ -31,4 +31,14 @@ MILO/
 │   ├── train.py      # Training loop
 │   ├── main.py       
 │   └── utils.py      # Helper functions
+│
+├── notebooks/
+│   └── main.ipynb
+```
 
+
+## Updates
+
+### July 25, 2025
+
+The basic version of MILO is ready. It's trained on MNIST dataset and outputs 10 probabilities. The argmax is selected as the predicted label. Next step would be to develop this further into a ping-pong model where multiple MILONets of opposing structure should have the same input and output respectively, like a horizontal hour-glass. The lowest dimensional network can hopefully be used to generate some nice images.

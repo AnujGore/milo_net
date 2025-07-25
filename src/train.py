@@ -17,12 +17,11 @@ def create_state_MLP(rng, model, learning_rate, data_size, device=None):
 @jax.jit
 def train_MLP(state, batch):
     def loss_fn(params):
-        preds = state.apply_fn({"params": params}, batch["x"])
-        preds = jnp.squeeze(preds)
-        loss = optax.l2_loss(preds, batch["y"]).mean()
+        logits = state.apply_fn({"params": params}, batch["image"])
+        logits = jnp.squeeze(logits, -1)
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits = logits.squeeze(), labels = batch['label']).mean()
         return loss
-
-    grad_fn = jax.grad(loss_fn)
+    grad_fn = jax.grad(loss_fn, has_aux=False)
     grads = grad_fn(state.params)
    
     state = state.apply_gradients(grads = grads)
@@ -31,9 +30,14 @@ def train_MLP(state, batch):
 
 @jax.jit
 def eval_MLP(state, batch):
-    preds = state.apply_fn({"params": state.params}, batch["x"])
-    preds = jnp.squeeze(preds)
-    loss = optax.l2_loss(preds, batch["y"]).mean()
-    return {"loss": loss,
-            "preds": preds,
-            "target": batch["y"]}
+    logits = state.apply_fn({"params": state.params}, batch["image"])
+    logits = jnp.squeeze(logits, -1)
+    loss = optax.softmax_cross_entropy_with_integer_labels(logits = logits.squeeze(), labels=batch['label']).mean()
+
+    return loss
+
+
+@jax.jit
+def pred_label(state, batch):
+    preds = state.apply_fn({"params": state.params}, batch["image"])
+    return preds.argmax(axis = 1)
