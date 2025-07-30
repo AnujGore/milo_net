@@ -1,12 +1,63 @@
-from model import MiloMLP, CNN
-from train import create_state_MLP, train_step_cnn, train_step_milo, pred_label
 import jax
 import numpy as np
+import jax.numpy as jnp
+import optax
 import tensorflow_datasets as tfds  # TFDS to download MNIST.
 import tensorflow as tf  # TensorFlow / `tf.data` operations.
 from rich.progress import track
 import time
 tf.random.set_seed(0) 
+import sys
+import os
+
+project_root = os.path.abspath(os.path.join(os.getcwd(), ".."))  # Moves one directory up
+sys.path.append(project_root)
+
+from src.model import MiloMLP, CNN
+from src.train import create_state_MLP
+
+@jax.jit
+def train_step_milo(state, batch):
+    def loss_fn(params):
+        logits = state.apply_fn({"params": params}, batch["image"])
+        logits = jnp.squeeze(logits, -1)
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits = logits.squeeze(), labels = batch['label']).mean()
+        return loss, logits
+
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (loss, logits), grads = grad_fn(state.params)
+    state = state.apply_gradients(grads=grads)
+    metrics = compute_metrics(logits, batch['label'])
+    return state, metrics
+
+@jax.jit
+def train_step_cnn(state, batch):
+    def loss_fn(params):
+        logits = state.apply_fn({"params": params}, batch["image"])
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits = logits, labels = batch['label']).mean()
+        return loss, logits
+
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (loss, logits), grads = grad_fn(state.params)
+    state = state.apply_gradients(grads=grads)
+    metrics = compute_metrics(logits, batch['label'])
+    return state, metrics
+
+@jax.jit
+def eval_step(state, batch):
+    logits = state.apply_fn(state.params, batch['image'])
+    return compute_metrics(logits, batch['label'])
+
+
+@jax.jit
+def pred_label(state, batch):
+    preds = state.apply_fn({"params": state.params}, batch["image"])
+    return preds.argmax(axis = 1)
+
+def compute_metrics(logits, labels):
+    loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
+    accuracy = jnp.mean(jnp.argmax(logits, -1) == labels)
+    return {'loss': loss, 'accuracy': accuracy}
 
 rng = jax.random.PRNGKey(0)
 device = jax.devices("cpu")[0] #Currently CPU
@@ -117,11 +168,6 @@ for epoch in track(range(NUM_EPOCHS), description="Training"):
 from flax.serialization import to_bytes
 import json
 import numpy as np
-import sys
-import os
-
-project_root = os.path.abspath(os.path.join(os.getcwd(), ".."))  # Moves one directory up
-sys.path.append(project_root)
 
 os.makedirs("models", exist_ok=True)
 

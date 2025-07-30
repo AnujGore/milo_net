@@ -1,5 +1,6 @@
 import jax.numpy as jnp
 import jax
+import tensorflow as tf
 
 def batch_loader(dataset_x, dataset_y, batch_size, device):
     dataset_size = len(dataset_x)
@@ -13,3 +14,7 @@ def batch_loader(dataset_x, dataset_y, batch_size, device):
             "y": jax.device_put(batch_y, device)
         }
         yield batch
+
+def preprocess(sample):
+    image = tf.cast(sample['image'], tf.float32) / 255.0
+    return image, sample['label']

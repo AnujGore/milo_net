@@ -38,18 +38,34 @@ class MiloMLP(nn.Module):
     input_dim: Tuple[int, int]
     hidden_layer_dim: Sequence[Tuple[int, int]]
     output_dim: Tuple[int, int]
+    num_channels: int
 
     @nn.compact
     def __call__(self, x):
-        current_input_rows = self.input_dim[0]
-        current_input_cols = self.input_dim[1]
-        for layer_left, layer_right in self.hidden_layer_dim:
-            x = MiloNet(current_input_rows, current_input_cols, layer_left, layer_right)(x)
-            current_input_rows = layer_left
-            current_input_cols = layer_right
-            x = nn.relu(x)
-        x = MiloNet(current_input_rows, current_input_cols, self.output_dim[0], self.output_dim[1])(x)
-        return x
+
+        def milo_branch(x):
+            current_input_rows = self.input_dim[0]
+            current_input_cols = self.input_dim[1]
+            for layer_left, layer_right in self.hidden_layer_dim:
+                x = MiloNet(current_input_rows, current_input_cols, layer_left, layer_right)(x)
+                current_input_rows = layer_left
+                current_input_cols = layer_right
+                x = nn.relu(x)
+            x = MiloNet(current_input_rows, current_input_cols, self.output_dim[0], self.output_dim[1])(x)
+            return x
+        
+        if self.num_channels == 1:
+            x_out = milo_branch(x)
+        else:
+            channel_outputs = []
+            for i in range(self.num_channels):
+                x_i = milo_branch(x[..., i])
+                channel_outputs.append(x_i)
+            x_out = jnp.concatenate(channel_outputs, axis=1)
+            x_out = nn.Dense(self.output_dim[0])(x_out.squeeze())
+        
+        return x_out
+
     
 class CNN(nn.Module):
     @nn.compact
@@ -64,4 +80,15 @@ class CNN(nn.Module):
         x = nn.Dense(128)(x)
         x = nn.relu(x)
         x = nn.Dense(10)(x)
+        return x
+    
+class MLP(nn.Module):
+    hidden_dims: list
+
+    @nn.compact
+    def __call__(self, x):
+        for layer in self.hidden_dims[:-1]:
+            x = nn.Dense(layer)(x)
+            x = nn.relu(x)
+        x = nn.Dense(self.hidden_dims[-1])(x)  
         return x
