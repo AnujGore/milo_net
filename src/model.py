@@ -1,7 +1,7 @@
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
-from typing import Sequence, Tuple
+from typing import Sequence, Tuple, Optional
 from flax.linen import initializers
 import jax.lax as lax
 from flax.typing import (
@@ -10,6 +10,54 @@ from flax.typing import (
 )
 
 default_weight_init = initializers.lecun_normal()
+
+class ResidualBlock(nn.Module):
+    features: int
+
+    @nn.compact
+    def __call__(self, x):
+        residual = x
+        x = nn.Conv(self.features, kernel_size=(3, 3), strides=(1, 1), padding='SAME')(x)
+        x = nn.relu(x)
+        x = nn.Conv(self.features, kernel_size=(3, 3), strides=(1, 1), padding='SAME')(x)
+        x += residual  # Residual connection
+        x = nn.relu(x)
+        return x
+
+
+class MiloResidual(nn.Module):
+    input_dim: Tuple[int, int]
+    hidden_layer_dim: Sequence[Tuple[int, int]]
+    output_dim: Tuple[int, int]
+
+    @nn.compact
+    def milo_branch(self, x):
+        residual = x
+
+        current_input_rows = self.input_dim[0]
+        current_input_cols = self.input_dim[1]
+        for i, (layer_left, layer_right) in enumerate(self.hidden_layer_dim):
+            x = MiloNet(current_input_rows, current_input_cols, layer_left, layer_right)(x)
+
+            if residual.shape != x.shape:
+                residual = MiloNet(current_input_rows, current_input_cols, layer_left, layer_right)(residual)
+
+            if i % 2 == 0: #Alternate residual connections
+                x += residual
+
+            x = nn.relu(x)
+
+            current_input_rows = layer_left
+            current_input_cols = layer_right
+
+        x = MiloNet(current_input_rows, current_input_cols, self.output_dim[0], self.output_dim[1])(x)
+        return x
+    
+    @nn.compact
+    def __call__(self, x):
+        x_out = self.milo_branch(x)
+        return x_out
+
 
 class MiloNet(nn.Module):
     input_rows: int
@@ -28,112 +76,64 @@ class MiloNet(nn.Module):
         bias = self.param('bias', self.bias_init, (self.next_dim_size_left, self.next_dim_size_right), self.param_dtype)
 
         y = lax.dot_general(lhs=weight_matrix_left, rhs=inputs, dimension_numbers=(((1,), (1,)), ((), ())))
-        y = lax.dot_general(lhs=weight_matrix_right, rhs=y, dimension_numbers=(((0,), (2,)), ((), ())))
-        y = y.transpose(2, 1, 0)
-        y += jnp.reshape(bias, (-1, self.next_dim_size_left, self.next_dim_size_right))
+        y = lax.dot_general(lhs=weight_matrix_right, rhs=y, dimension_numbers=(((0,), (inputs.ndim - 1,)), ((), ()))).swapaxes(0, inputs.ndim - 1)
+        y += jnp.reshape(bias, ( -1, bias.shape[0], bias.shape[1]))
 
         return y
     
-class MiloMLP(nn.Module):
+    
+class Milo(nn.Module):
     input_dim: Tuple[int, int]
     hidden_layer_dim: Sequence[Tuple[int, int]]
-    output_dim: Tuple[int, int]
-    num_channels: int
+    output_dim: int 
+    channel_output_dim: Optional[Tuple[int, int]] = None
+    num_channels: Optional[int] = None
 
     @nn.compact
     def __call__(self, x):
 
-        def milo_branch(x):
-            current_input_rows = self.input_dim[0]
-            current_input_cols = self.input_dim[1]
-            for layer_left, layer_right in self.hidden_layer_dim:
-                x = MiloNet(current_input_rows, current_input_cols, layer_left, layer_right)(x)
-                current_input_rows = layer_left
-                current_input_cols = layer_right
-                x = nn.relu(x)
-            x = MiloNet(current_input_rows, current_input_cols, self.output_dim[0], self.output_dim[1])(x)
-            return x
-        
-        if self.num_channels == 1:
-            x_out = milo_branch(x)
+        if self.num_channels == None:
+            #Single channel does not need multiple milos
+            model = MiloResidual(
+                input_dim=self.input_dim,
+                hidden_layer_dim=self.hidden_layer_dim,
+                output_dim=self.output_dim
+            )
+
+            logits = model(x)
+ 
         else:
-            channel_outputs = []
-            for i in range(self.num_channels):
-                x_i = milo_branch(x[..., i])
-                channel_outputs.append(x_i)
-            x_out = jnp.concatenate(channel_outputs, axis=1)
-            x_out = nn.Dense(self.output_dim[0])(x_out.squeeze())
-        
-        return x_out
+            # One MILO branch definition (parameters shared for all channels)
+            milo_branch = MiloResidual(
+                input_dim=self.input_dim,
+                hidden_layer_dim=self.hidden_layer_dim,
+                output_dim=self.channel_output_dim
+            )
 
-class MiloWCon(nn.Module):
-    input_dim: Tuple[int, int]
-    hidden_layer_dim: Sequence[Tuple[int, int]]
-    output_dim: Tuple[int, int]
-    num_channels: int
+            channel_outputs = jax.vmap(milo_branch, in_axes=-1)(x)
 
+            channel_outputs = channel_outputs.squeeze(-1)
+            channel_outputs = jnp.moveaxis(channel_outputs, 0, 1) 
+            combined = channel_outputs.reshape(channel_outputs.shape[0], -1) 
 
-    @nn.compact
-    def single_milonet_block(self, x):
-        current_input_rows = self.input_dim[0]
-        current_input_cols = self.input_dim[1]
-        for layer_left, layer_right in self.hidden_layer_dim:
-            x = MiloNet(current_input_rows, current_input_cols, layer_left, layer_right)(x)
-            current_input_rows = layer_left
-            current_input_cols = layer_right
-            x = nn.relu(x)
-        x = MiloNet(current_input_rows, current_input_cols, self.output_dim[0], self.output_dim[1])(x)
-        return x
+            # Final MLP for classification
+            logits = nn.Dense(10)(combined)
 
-    @nn.compact
-    def __call__(self, x_in):
-        
-        outputs = []
-
-        if self.num_channels == 1:
-            x_channel = x_in[..., 0]                   #remove channel
-            x_i = self.single_milonet_block(x_channel)           
-            outputs.append(x_i)
-
-        else:
-            x = nn.Conv(features=32, kernel_size=(3, 3), use_bias=True)(x_in)
-            x = nn.relu(x)
-            x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
-
-            x = nn.Conv(features=64, kernel_size=(3, 3), use_bias=True)(x)
-            x = nn.relu(x)
-            x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
-
-            x_split = jnp.moveaxis(x, -1, 0)
-            x_outs = jax.vmap(self.single_milonet_block, in_axes=(0,))(x_split)
-            outputs.extend(x_outs) 
-
-            # for i in range(x.shape[-1]):
-            #     x_channel = x[..., i]                #channel split
-            #     x_i = self.single_milonet_block(x_channel)           
-            #     outputs.append(x_i)
-
-        x_out = jnp.concatenate(outputs, axis=1)
-        x_out = nn.Dense(self.output_dim[0])(x_out.squeeze())
-
-        return x_out
+        return logits
 
 
 class CNN(nn.Module):
-    
+    num_classes: int = 10
+
     @nn.compact
     def __call__(self, x):
-        x = nn.Conv(features=32, kernel_size=(3, 3), use_bias=True)(x)
+        x = nn.Conv(64, kernel_size=(7, 7), strides=(2, 2), padding='SAME')(x)
         x = nn.relu(x)
-        x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
+        x = nn.max_pool(x, window_shape=(3, 3), strides=(2, 2), padding='SAME')
 
-        x = nn.Conv(features=64, kernel_size=(3, 3), use_bias=True)(x)
-        x = nn.relu(x)
-        x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
+        for _ in range(3):
+            x = ResidualBlock(64)(x)
 
-        x = x.reshape((x.shape[0], -1))  # flatten
-        x = nn.Dense(128)(x)
-        x = nn.relu(x)
-        x = nn.Dense(10)(x)
-        
+        x = jnp.mean(x, axis=(1, 2))
+        x = nn.Dense(self.num_classes)(x)
         return x

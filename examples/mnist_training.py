@@ -13,7 +13,7 @@ import os
 project_root = os.path.abspath(os.path.join(os.getcwd(), "."))  # Moves one directory up
 sys.path.append(project_root)
 
-from src.model import MiloMLP, CNN
+from src.model import Milo, CNN
 from src.train import create_state_MLP
 
 @jax.jit
@@ -86,11 +86,10 @@ train_ds = train_ds.repeat().shuffle(1024)
 train_ds = train_ds.batch(BATCH_SIZE, drop_remainder=True).take(2500).cache().prefetch(1)
 test_ds = test_ds.batch(BATCH_SIZE, drop_remainder=True).prefetch(1)
 
-milo = MiloMLP(
+milo = Milo(
     input_dim=(28, 28), 
     hidden_layer_dim=[(64, 64), (36, 36), (18, 16), (10, 1)],
-    output_dim=(10, 1),
-    num_channels=1 
+    output_dim=(10, 1)
 )
 
 simpleCNN = CNN()

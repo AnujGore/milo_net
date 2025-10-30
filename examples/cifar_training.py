@@ -12,7 +12,7 @@ import os
 project_root = os.path.abspath(os.path.join(os.getcwd(), "."))  # Moves one directory up
 sys.path.append(project_root)
 
-from src.model import MiloMLP, CNN, MiloWCon
+from src.model import Milo, CNN
 from src.train import create_state_MLP
 from src.utils import preprocess
 
@@ -21,15 +21,15 @@ from src.utils import preprocess
 def train_step(state, batch):
     def loss_fn(params):
         logits = state.apply_fn({"params": params}, batch[0])
-        loss = optax.softmax_cross_entropy_with_integer_labels(logits = logits, labels = batch[1]).mean()
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits = jnp.squeeze(logits), labels = batch[1]).mean()
         return loss, logits
     
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     (_, logits), grads = grad_fn(state.params)
     state = state.apply_gradients(grads=grads)
 
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels = batch[1]).mean()
-    accuracy = jnp.mean(jnp.argmax(logits, -1) == batch[1])
+    loss = optax.softmax_cross_entropy_with_integer_labels(jnp.squeeze(logits), labels = batch[1]).mean()
+    accuracy = jnp.mean(jnp.argmax(jnp.squeeze(logits), -1) == batch[1])
 
     return state, loss, accuracy
         
@@ -38,160 +38,186 @@ def eval_step(state, label):
     preds = state.apply_fn({"params": state.params}, label)
     return preds
 
+def evaluate_model(state, val_ds):
+    val_losses = []
+    val_accuracies = []
+    
+    for batch in val_ds.as_numpy_iterator():
+        inputs, labels = batch
+        preds = eval_step(state, inputs)
+        
+        loss = optax.softmax_cross_entropy_with_integer_labels(jnp.squeeze(preds), labels = batch[1]).mean()
+        accuracy = np.mean(np.argmax(jnp.squeeze(preds), axis=-1) == labels)
+        
+        val_losses.append(loss)
+        val_accuracies.append(accuracy)
+
+    return val_losses, val_accuracies
+
+
 rng = jax.random.PRNGKey(0)
 device = jax.devices("cpu")[0] #Currently CPU
 
 #Load and normalize the dataset
 train_ds: tf.data.Dataset = tfds.load('cifar10', split='train')
-train_ds = train_ds.map(preprocess).cache().shuffle(1024).batch(32, drop_remainder=True).take(2500).prefetch(1)
+train_ds_cnn = train_ds.map(preprocess).cache().shuffle(1024).batch(32, drop_remainder=True).take(2500).prefetch(1)
+train_ds_milo = train_ds.map(preprocess).cache().shuffle(1024).batch(32, drop_remainder=True).take(2500).prefetch(1)
 
-#Hyperparameters
+val_ds: tf.data.Dataset = tfds.load('cifar10', split='test')
+val_ds_cnn = val_ds.map(preprocess).cache().batch(32).prefetch(1)
+val_ds_milo = val_ds.map(preprocess).cache().batch(32).prefetch(1)
+
+# =============================
+# Hyperparameters
+# =============================
 BATCH_SIZE = 32
-lr = 1e-3
-NUM_EPOCHS = 100
+LR = 1e-3
+NUM_EPOCHS = 200
+PATIENCE = 50
 
-milo_con_multichannel = MiloWCon(
-    input_dim=(8, 8), 
-    hidden_layer_dim=[(16, 16), (10, 1)],
-    output_dim=(10, 1),
-    num_channels=3
-)
+# =============================
+# Model Instantiation
+# =============================
 
-milo_multichannel = MiloMLP(
+
+milo = Milo(
     input_dim=(32, 32), 
-    hidden_layer_dim=[(64, 64), (32, 32), (24, 18), (16, 9), (10, 1)],
-    output_dim=(10, 1),
+    hidden_layer_dim=[(64, 64), (128, 128), (256, 256), (512, 512), (256, 256), (128, 128), (64, 64), (36, 36), (18, 16), (10, 1)],
+    channel_output_dim = (10, 1),
+    output_dim=10,
     num_channels=3
 )
 
+
+# CNN baseline
 cnn_model = CNN()
 
-milo_multichannel_state = create_state_MLP(rng, milo_multichannel, lr, data_size=(BATCH_SIZE, 32, 32, 3), device=device)
-milo_con_multichannel_state = create_state_MLP(rng, milo_con_multichannel, lr, data_size=(BATCH_SIZE, 32, 32, 3), device=device)
-cnn_state = create_state_MLP(rng, cnn_model, lr, data_size=(BATCH_SIZE, 32, 32, 3), device=device)
+# =============================
+# Create states
+# =============================
+milo_state = create_state_MLP(rng, milo, LR, data_size=(BATCH_SIZE, 32, 32, 3), device=device)
+cnn_state = create_state_MLP(rng, cnn_model, LR, data_size=(BATCH_SIZE, 32, 32, 3), device=device)
 
 del rng
 
-milo_best_loss = np.inf; cnn_best_loss = np.inf; milo_con_best_loss = np.inf
-milo_best_state = None; cnn_best_state = None; milo_con_best_state = None
+# =============================
+# Tracking
+# =============================
+patience_counters = {"milo": 0, "cnn": 0}
+best_val_losses = {"milo": np.inf, "cnn": np.inf}
+best_states = {"milo": None, "cnn": None}
 
-metrics_history = {
-    'milo_loss': [], 'milo_loss_std': [],
-    'milo_accuracy': [], 'milo_accuracy_std': [],
-    'milo_time': [], 'milo_time_std': [],
-    'milo_con_loss': [], 'milo_con_loss_std': [],
-    'milo_con_accuracy': [], 'milo_con_accuracy_std': [],
-    'milo_con_time': [], 'milo_con_time_std': [],
-    'cnn_loss': [], 'cnn_loss_std': [],
-    'cnn_accuracy': [], 'cnn_accuracy_std': [],
-    'cnn_time': [], 'cnn_time_std': [],
-}
+metrics_history = {k: [] for k in [
+    'milo_train_loss', 'milo_rgb_train_loss_std',
+    'milo_train_accuracy', 'milo_rgb_train_accuracy_std',
+    'milo_val_loss', 'milo_rgb_val_loss_std',
+    'milo_val_accuracy', 'milo_rgb_val_accuracy_std',
+    'milo_time', 'milo_rgb_time_std',
 
+    'cnn_train_loss', 'cnn_train_loss_std',
+    'cnn_train_accuracy', 'cnn_train_accuracy_std',
+    'cnn_val_loss', 'cnn_val_loss_std',
+    'cnn_val_accuracy', 'cnn_val_accuracy_std',
+    'cnn_time', 'cnn_time_std'
+]}
 
-
+# =============================
+# Training Loop
+# =============================
 with Progress(
     TextColumn("[bold blue]{task.description}"),
     BarColumn(),
     MofNCompleteColumn(),
     TimeElapsedColumn(),
-    TimeRemainingColumn(),
-    transient=True  # hides progress bars after completion
+    TimeRemainingColumn()
 ) as progress:
 
-    milo_task = progress.add_task("Training Milo Model...", total=NUM_EPOCHS)
-    milo_con_task = progress.add_task("Training Milo (with Convolutions) Model...", total=NUM_EPOCHS)
-    cnn_task = progress.add_task("Training CNN Model...", total=NUM_EPOCHS)
+    # Progress bar tasks
+    tasks = {
+        "milo": progress.add_task("Training Milo...", total=NUM_EPOCHS),
+        "cnn": progress.add_task("Training CNN...", total=NUM_EPOCHS)
+    }
 
     for epoch in range(NUM_EPOCHS):
-        milo_loss, milo_accuracy, milo_time = [], [], []
-        milo_con_loss, milo_con_accuracy, milo_con_time = [], [], []
-        cnn_loss, cnn_accuracy, cnn_time = [], [], []
-        
-        for step, batch in enumerate(train_ds.as_numpy_iterator()):
-            labels = np.expand_dims(batch[1], axis=(1))
+        # --- Epoch metrics ---
+        epoch_metrics = {
+            "milo": {"loss": [], "acc": [], "time": []},
+            "cnn": {"loss": [], "acc": [], "time": []}
+        }
 
-            # Milo training step
-            start_time = time.time()
-            milo_multichannel_state, this_loss, accuracy = train_step(milo_multichannel_state, batch)
-            milo_time.append(time.time() - start_time)
-            milo_loss.append(this_loss)
-            milo_accuracy.append(accuracy)
+        # --- Training pass ---
+        for (milo_batch, cnn_batch) in zip(train_ds_milo.as_numpy_iterator(),
+                                           train_ds_cnn.as_numpy_iterator()):
+            milo_x, milo_y = milo_batch
+            cnn_x, cnn_y = cnn_batch
 
-        progress.update(milo_task, advance=1, description=f"Training Milo Model... Loss: {np.mean(milo_loss):.4f} ± {np.std(milo_loss):.4f}")
+            # MiloRGB model training
+            start = time.time()
+            milo_state, loss, acc = train_step(milo_state, (milo_x, milo_y))
+            epoch_metrics["milo"]["time"].append(time.time() - start)
+            epoch_metrics["milo"]["loss"].append(loss)
+            epoch_metrics["milo"]["acc"].append(acc)
 
-        for step, batch in enumerate(train_ds.as_numpy_iterator()):
-            labels = np.expand_dims(batch[1], axis=(1))
+            # CNN model training
+            start = time.time()
+            cnn_state, loss, acc = train_step(cnn_state, (cnn_x, cnn_y))
+            epoch_metrics["cnn"]["time"].append(time.time() - start)
+            epoch_metrics["cnn"]["loss"].append(loss)
+            epoch_metrics["cnn"]["acc"].append(acc)
 
-            # Milo training step
-            start_time = time.time()
-            milo_con_multichannel_state, this_loss, accuracy = train_step(milo_con_multichannel_state, batch)
-            milo_con_time.append(time.time() - start_time)
-            milo_con_loss.append(this_loss)
-            milo_con_accuracy.append(accuracy)
+        # --- Update progress ---
+        for model_key in ["milo", "cnn"]:
+            progress.update(
+                tasks[model_key],
+                advance=1,
+                description=f"Training {model_key}... "
+                            f"Loss: {np.mean(epoch_metrics[model_key]['loss']):.4f} ± {np.std(epoch_metrics[model_key]['loss']):.4f} "
+                            f"Acc: {np.mean(epoch_metrics[model_key]['acc']):.4f} ± {np.std(epoch_metrics[model_key]['acc']):.4f}"
+            )
 
-        progress.update(milo_con_task, advance=1, description=f"Training Milo (with Convolutions) Model... Loss: {np.mean(milo_con_loss):.4f} ± {np.std(milo_con_loss):.4f}")
+        # --- Validation ---
+        for model_key, (val_ds_used, state) in [
+            ("milo", (val_ds_milo, milo_state)),
+            ("cnn", (val_ds_cnn, cnn_state))
+        ]:
+            val_loss, val_acc = evaluate_model(state, val_ds_used)
 
-        for step, batch in enumerate(train_ds.as_numpy_iterator()):
-            labels = np.expand_dims(batch[1], axis=(1))
+            if np.mean(val_loss) < best_val_losses[model_key]:
+                best_val_losses[model_key] = np.mean(val_loss)
+                best_states[model_key] = state
+                patience_counters[model_key] = 0
+            else:
+                patience_counters[model_key] += 1
 
-            # CNN training step
-            start_time = time.time()
-            cnn_state, this_loss, accuracy = train_step(cnn_state, batch)
-            cnn_time.append(time.time() - start_time)
-            cnn_loss.append(this_loss)
-            cnn_accuracy.append(accuracy)
+            # Save metrics
+            metrics_history[f"{model_key}_train_loss"].append(np.mean(epoch_metrics[model_key]["loss"]))
+            metrics_history[f"{model_key}_train_loss_std"].append(np.std(epoch_metrics[model_key]["loss"]))
+            metrics_history[f"{model_key}_train_accuracy"].append(np.mean(epoch_metrics[model_key]["acc"]))
+            metrics_history[f"{model_key}_train_accuracy_std"].append(np.std(epoch_metrics[model_key]["acc"]))
+            metrics_history[f"{model_key}_val_loss"].append(np.mean(val_loss))
+            metrics_history[f"{model_key}_val_loss_std"].append(np.std(val_loss))
+            metrics_history[f"{model_key}_val_accuracy"].append(np.mean(val_acc))
+            metrics_history[f"{model_key}_val_accuracy_std"].append(np.std(val_acc))
+            metrics_history[f"{model_key}_time"].append(np.mean(epoch_metrics[model_key]["time"]))
+            metrics_history[f"{model_key}_time_std"].append(np.std(epoch_metrics[model_key]["time"]))
 
-        progress.update(cnn_task, advance=1, description=f"Training CNN Model... Loss: {np.mean(cnn_loss):.4f} ± {np.std(cnn_loss):.4f}")
+        # --- Early stopping ---
+        if all(patience_counters[m] >= PATIENCE for m in patience_counters):
+            print("Early stopping triggered for all models.")
+            break
 
-
-        metrics_history['milo_loss'].append(np.mean(milo_loss))
-        metrics_history['milo_loss_std'].append(np.std(milo_loss))
-        metrics_history['milo_accuracy'].append(np.mean(milo_accuracy))
-        metrics_history['milo_accuracy_std'].append(np.std(milo_accuracy))
-        metrics_history['milo_time'].append(np.mean(milo_time))
-        metrics_history['milo_time_std'].append(np.std(milo_time))
-
-        metrics_history['milo_con_loss'].append(np.mean(milo_con_loss))
-        metrics_history['milo_con_loss_std'].append(np.std(milo_con_loss))
-        metrics_history['milo_con_accuracy'].append(np.mean(milo_con_accuracy))
-        metrics_history['milo_con_accuracy_std'].append(np.std(milo_con_accuracy))
-        metrics_history['milo_con_time'].append(np.mean(milo_con_time))
-        metrics_history['milo_con_time_std'].append(np.std(milo_con_time))
-
-        metrics_history['cnn_loss'].append(np.mean(cnn_loss))
-        metrics_history['cnn_loss_std'].append(np.std(cnn_loss))
-        metrics_history['cnn_accuracy'].append(np.mean(cnn_accuracy))
-        metrics_history['cnn_accuracy_std'].append(np.std(cnn_accuracy))
-        metrics_history['cnn_time'].append(np.mean(cnn_time))
-        metrics_history['cnn_time_std'].append(np.std(cnn_time))
-
-        if np.mean(milo_loss) < milo_best_loss:
-            milo_best_loss = np.mean(milo_loss)
-            milo_best_state = milo_multichannel_state
-        
-        if np.mean(milo_con_loss) < milo_con_best_loss:
-            milo_con_best_loss = np.mean(milo_con_loss)
-            milo_con_best_state = milo_con_multichannel_state
-
-        if np.mean(cnn_loss) < cnn_best_loss:
-            cnn_best_loss = np.mean(cnn_loss)
-            cnn_best_state = cnn_state
-
+# =============================
+# Save models
+# =============================
+os.makedirs("models", exist_ok=True)
 from flax.serialization import to_bytes
 import json
 
-os.makedirs("models", exist_ok=True)
+for model_key in best_states:
+    with open(f"models/{model_key}_cifar_best_state.msgpack", "wb") as f:
+        f.write(to_bytes(best_states[model_key]))
 
-with open("models/milo_cifar_best_state.msgpack", "wb") as f:
-    f.write(to_bytes(milo_best_state))
-
-with open("models/cnn_cifar_best_state.msgpack", "wb") as f:
-    f.write(to_bytes(cnn_best_state))
-
-with open("models/milo_con_cifar_best_state.msgpack", "wb") as f:
-    f.write(to_bytes(milo_con_best_state))
-
-# --- Save metrics to JSON ---
+# Save metrics
 def convert_metrics_to_serializable(metrics):
     return {k: list(map(float, v)) for k, v in metrics.items()}
 
